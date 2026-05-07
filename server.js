@@ -131,6 +131,8 @@ async function connectToESP32() {
   const portPath = await findESP32Port();
   if (!portPath) {
     sensorData.connected = false;
+    // Keep polling — user may plug the ESP32 in after the server starts
+    scheduleReconnect();
     return;
   }
 
