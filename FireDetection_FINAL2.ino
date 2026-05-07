@@ -1,21 +1,39 @@
 // ============================================================================
-//  INTELLIGENT FIRE DETECTION SYSTEM — ESP32 Edition
+//  INTELLIGENT FIRE DETECTION SYSTEM — ESP32 + Blynk IoT
 //  Platform  : ESP32 (38-pin DevKit or WROOM-32)
-//  Version   : 4.0.1
+//  Version   : 5.0.0
 // ----------------------------------------------------------------------------
-//  NEW in v4.0 (ESP32):
-//    - Built-in WiFi with network scan + credential setup via Serial Monitor
-//    - Credentials saved to NVS flash (Preferences) — survives power cycles
-//    - Fixed buzzer: 3-phase siren (HIGH → LOW → SILENT) — no more stuck tone
-//    - Smoke threshold: 500 ADC (warning at >500)
-//    - Sim mode smoke corrected to 600 (above 500 threshold)
-//    - sendSensorData() sends JSON to Serial for web dashboard bridge
-//  FIXED in v4.0.1:
-//    - PIN_LED_GREEN moved to GPIO 27 (GPIO 17 not exposed on this board)
-//    - Corrected ADC2 pin comment — GPIO 27 used as digital output only, no conflict
-//    - Corrected DHT11 pin comment — GPIO 4 is digital, ADC2 note was misleading
-//    - Removed stale comment about WIFI reconfigure in checkButton() body
+//  WHAT'S NEW in v5.0 (Blynk IoT integration):
+//    - Blynk IoT push notifications on phone when fire/smoke detected
+//    - fire_alert  event: triggers when alarm reaches DANGER (level 2)
+//    - smoke_warning event: triggers when alarm reaches WARNING (level 1)
+//    - Virtual pins for Blynk dashboard live widgets:
+//        V0 = Temperature °C   (Gauge: 0–80)
+//        V1 = Smoke ADC        (Gauge: 0–4095)
+//        V2 = Flame 0/1        (LED widget)
+//        V3 = Alarm level 0/1/2 (Value display)
+//    - Uses Blynk.config() + Blynk.connect() so our custom NVS WiFi setup
+//      remains intact — Blynk piggy-backs on the existing connection.
+//    - blynk field added to JSON → web dashboard shows Blynk status chip.
+//
+//  SETUP STEPS (Blynk):
+//    1. Install "Blynk" library via Arduino Library Manager (by Volodymyr Shymanskyy).
+//    2. Create a free account at blynk.cloud.
+//    3. New Project → ESP32 → Copy your Auth Token below.
+//    4. Replace BLYNK_TEMPLATE_ID, BLYNK_TEMPLATE_NAME, BLYNK_AUTH_TOKEN below.
+//    5. In Blynk console, create two Events:
+//         • Event code: fire_alert    — enable push notification
+//         • Event code: smoke_warning — enable push notification
+//    6. Add widgets to Blynk dashboard: Gauge V0 (Temp), Gauge V1 (Smoke),
+//       LED V2 (Flame), Value V3 (Level).
+//    7. Flash to ESP32. On first boot, configure WiFi via Serial Monitor.
 // ============================================================================
+
+// ── Blynk credentials (replace with your own from blynk.cloud) ───────────────
+// These MUST be defined BEFORE the Blynk include.
+#define BLYNK_TEMPLATE_ID    "TMPL_XXXXXXXXXX"       // e.g. "TMPL_Ab12Cd34Ef"
+#define BLYNK_TEMPLATE_NAME  "Fire Detection System"
+#define BLYNK_AUTH_TOKEN     "YOUR_BLYNK_AUTH_TOKEN"  // 32-char token from blynk.cloud
 
 // ── Libraries ────────────────────────────────────────────────────────────────
 #include <Wire.h>
@@ -23,51 +41,49 @@
 #include <DHT.h>                  // Adafruit DHT sensor library
 #include <WiFi.h>                 // ESP32 built-in
 #include <Preferences.h>          // ESP32 NVS key-value flash storage
+#include <BlynkSimpleEsp32.h>     // Blynk IoT (install via Library Manager)
 
 // ── ESP32 Pin Map ─────────────────────────────────────────────────────────────
 // IMPORTANT: GPIO 6–11 are reserved for SPI flash — never use them.
-// ADC2 pins conflict with WiFi only when used as analog inputs (analogRead).
-// Using ADC2-capable pins as digital I/O is safe regardless of WiFi state.
-#define PIN_DHT         4    // DHT11 data  (digital input — ADC2 note does not apply)
-#define PIN_SMOKE       34   // MQ-2 analog (ADC1_CH6 — input only, no pull-up)
+#define PIN_DHT         4    // DHT11 data
+#define PIN_SMOKE       34   // MQ-2 analog (ADC1_CH6 — input only)
 #define PIN_FLAME       13   // IR flame sensor — Active LOW
 #define PIN_BUTTON      15   // Mode toggle — Active LOW, INPUT_PULLUP
-#define PIN_BUZZER      25   // Passive buzzer — LEDC PWM channel 0
+#define PIN_BUZZER      25   // Passive buzzer — LEDC PWM
 #define PIN_RELAY       16   // Relay / fan — Active LOW
-#define PIN_LED_GREEN   27   // Green  LED (Safe + Warning) — GPIO 17 not on this board
+#define PIN_LED_GREEN   27   // Green  LED (Safe + Warning)
 #define PIN_LED_YELLOW  18   // Yellow LED (Warning only)
 #define PIN_LED_RED     19   // Red    LED (Danger — blinks)
 
-// I2C default on ESP32: SDA = GPIO 21, SCL = GPIO 22 (no change needed)
+// I2C default on ESP32: SDA = GPIO 21, SCL = GPIO 22
 
 // ── Sensor thresholds ─────────────────────────────────────────────────────────
 #define DHT_TYPE         DHT11
 #define TEMP_THRESHOLD   45.0f  // °C
-#define SMOKE_THRESHOLD  500    // ADC 0–4095 (ESP32 is 12-bit, Uno was 10-bit)
-                                // MQ-2 at rest ≈ 100–300, smoke ≈ 500–2000
+#define SMOKE_THRESHOLD  500    // ADC 0–4095 (ESP32 12-bit)
 
 // ── Timing constants (ms) ─────────────────────────────────────────────────────
-#define INTERVAL_SENSOR   2000UL
+#define INTERVAL_SENSOR    2000UL
 #define INTERVAL_SERIAL   15000UL
-#define INTERVAL_BLINK    500UL
-#define DEBOUNCE_MS       50UL
-#define WIFI_TIMEOUT_MS   15000UL  // 15 s connection timeout
+#define INTERVAL_BLINK      500UL
+#define INTERVAL_JSON      2000UL
+#define INTERVAL_BLYNK     5000UL  // how often to push data to Blynk virtual pins
+#define DEBOUNCE_MS          50UL
+#define WIFI_TIMEOUT_MS   15000UL
 
 // ── Buzzer 3-phase siren ──────────────────────────────────────────────────────
-// Phase 0: HIGH tone (400 ms) → Phase 1: LOW tone (300 ms) → Phase 2: silence (300 ms)
-// This creates a proper pulsing alarm instead of a continuous screech.
-#define TONE_HIGH        1800   // Hz
-#define TONE_LOW          600   // Hz
-#define SIREN_PHASE_0_MS  400UL // high note duration
-#define SIREN_PHASE_1_MS  300UL // low  note duration
-#define SIREN_PHASE_2_MS  300UL // silence duration
+#define TONE_HIGH        1800
+#define TONE_LOW          600
+#define SIREN_PHASE_0_MS  400UL
+#define SIREN_PHASE_1_MS  300UL
+#define SIREN_PHASE_2_MS  300UL
 
-// ── ESP32 LEDC (PWM) for tone() ───────────────────────────────────────────────
+// ── LEDC (buzzer PWM) ─────────────────────────────────────────────────────────
 #define LEDC_CHANNEL     0
-#define LEDC_RESOLUTION  8    // 8-bit (0–255)
+#define LEDC_RESOLUTION  8
 
 // ── LCD ───────────────────────────────────────────────────────────────────────
-#define LCD_ADDR  0x3F   // common address; try 0x27 if blank
+#define LCD_ADDR  0x3F
 #define LCD_COLS  16
 #define LCD_ROWS  2
 
@@ -75,6 +91,12 @@
 #define NVS_NAMESPACE  "firedet"
 #define NVS_KEY_SSID   "ssid"
 #define NVS_KEY_PASS   "pass"
+
+// ── Blynk virtual pins ────────────────────────────────────────────────────────
+#define VPIN_TEMP    V0  // Gauge 0–80 °C
+#define VPIN_SMOKE   V1  // Gauge 0–4095 ADC
+#define VPIN_FLAME   V2  // LED widget (0 or 1)
+#define VPIN_LEVEL   V3  // Value display (0 / 1 / 2)
 
 // ============================================================================
 //  OBJECTS
@@ -87,10 +109,10 @@ Preferences       prefs;
 //  STATE STRUCTURES
 // ============================================================================
 struct SensorData {
-  float   temperature;
-  float   humidity;
-  int     smokeRaw;
-  bool    flameDetected;
+  float temperature;
+  float humidity;
+  int   smokeRaw;
+  bool  flameDetected;
 };
 
 struct FusionResult {
@@ -107,6 +129,7 @@ struct SystemState {
   bool         simMode;
   bool         relayActive;
   bool         wifiConnected;
+  bool         blynkConnected;
   String       wifiSSID;
   String       localIP;
 };
@@ -120,11 +143,15 @@ static unsigned long lastBlinkTick   = 0;
 static unsigned long lastToneTick    = 0;
 static unsigned long lastButtonCheck = 0;
 static unsigned long lastJsonTick    = 0;
+static unsigned long lastBlynkTick   = 0;
 
-// ── Siren state (0=high, 1=low, 2=silent) ─────────────────────────────────────
+// ── Siren / blink state ───────────────────────────────────────────────────────
 static uint8_t sirenPhase     = 0;
 static bool    lcdBlinkState  = false;
 static bool    buttonLastState = HIGH;
+
+// ── Blynk alarm transition tracking ──────────────────────────────────────────
+static uint8_t blynkLastLevel = 255;  // sentinel — force first check
 
 // ── Forward declarations ──────────────────────────────────────────────────────
 void     readSensors();
@@ -135,6 +162,9 @@ void     checkButton();
 void     setupWifi();
 void     tryConnectWifi(const String& ssid, const String& pass);
 void     scanAndConfigureWifi();
+void     connectBlynk();
+void     pushBlynkData();
+void     sendBlynkEvent(uint8_t level);
 void     setLEDs(uint8_t level);
 void     setRelay(bool active);
 void     buzzerTone(uint32_t freq);
@@ -152,51 +182,43 @@ String   levelName(uint8_t level);
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println(F("\n=== Fire Detection System v4.0.1 — ESP32 ==="));
+  Serial.println(F("\n=== Fire Detection System v5.0.0 — ESP32 + Blynk ==="));
 
-  // ── Output pins ───────────────────────────────────────────────────────────
   pinMode(PIN_RELAY,      OUTPUT);
   pinMode(PIN_LED_GREEN,  OUTPUT);
   pinMode(PIN_LED_YELLOW, OUTPUT);
   pinMode(PIN_LED_RED,    OUTPUT);
+  pinMode(PIN_FLAME,      INPUT);
+  pinMode(PIN_BUTTON,     INPUT_PULLUP);
+  pinMode(PIN_SMOKE,      INPUT);
 
-  // ── Input pins ────────────────────────────────────────────────────────────
-  pinMode(PIN_FLAME,  INPUT);
-  pinMode(PIN_BUTTON, INPUT_PULLUP);
-  pinMode(PIN_SMOKE,  INPUT);  // GPIO 34 — input only
-
-  // ── LEDC (buzzer PWM) — ESP32 Arduino core v3.x API ─────────────────────
-  // ledcAttach(pin, freq, resolution) replaces the old ledcSetup/ledcAttachPin pair.
   ledcAttach(PIN_BUZZER, 1000, LEDC_RESOLUTION);
   buzzerOff();
 
-  // ── Safe startup state ───────────────────────────────────────────────────
   setRelay(false);
   setLEDs(0);
 
-  // ── I2C + LCD ─────────────────────────────────────────────────────────────
-  Wire.begin(21, 22);   // SDA=21, SCL=22 (ESP32 defaults)
+  Wire.begin(21, 22);
   lcd.init();
   lcd.backlight();
   lcd.clear();
-  lcd.setCursor(0, 0); lcd.print(F("Fire Det v4.0  "));
-  lcd.setCursor(0, 1); lcd.print(F("ESP32 Starting."));
+  lcd.setCursor(0, 0); lcd.print(F("Fire Det v5.0  "));
+  lcd.setCursor(0, 1); lcd.print(F("ESP32 + Blynk  "));
 
-  // ── DHT11 ────────────────────────────────────────────────────────────────
   dht.begin();
 
-  // ── Zero state ───────────────────────────────────────────────────────────
   memset(&sys, 0, sizeof(sys));
   sys.sensors.temperature = NAN;
   sys.sensors.humidity    = NAN;
   sys.wifiConnected       = false;
+  sys.blynkConnected      = false;
   sys.localIP             = "Not connected";
   sys.wifiSSID            = "";
 
-  // ── WiFi setup ────────────────────────────────────────────────────────────
+  // WiFi first, then Blynk piggy-backs on the connection
   setupWifi();
 
-  delay(500);
+  delay(300);
   lcd.clear();
   logToSerial(F("Boot complete. Monitoring started."));
 }
@@ -218,8 +240,20 @@ void loop() {
 
   handleAlarms();
 
-  // JSON data for web dashboard bridge (every 2 s)
-  if (now - lastJsonTick >= 2000UL) {
+  // Keep Blynk alive (non-blocking)
+  if (sys.wifiConnected) {
+    Blynk.run();
+    sys.blynkConnected = Blynk.connected();
+  }
+
+  // Push sensor data to Blynk virtual pins every 5 s
+  if (sys.wifiConnected && sys.blynkConnected && now - lastBlynkTick >= INTERVAL_BLYNK) {
+    lastBlynkTick = now;
+    pushBlynkData();
+  }
+
+  // JSON for web dashboard bridge every 2 s
+  if (now - lastJsonTick >= INTERVAL_JSON) {
     lastJsonTick = now;
     sendSensorData();
   }
@@ -233,53 +267,38 @@ void loop() {
     msg += isnan(sys.sensors.temperature)
              ? String(F("ERR"))
              : String(sys.sensors.temperature, 1) + String(F("C"));
-    msg += F(" | H:");
-    msg += isnan(sys.sensors.humidity)
-             ? String(F("ERR"))
-             : String(sys.sensors.humidity, 1) + String(F("%"));
     msg += F(" | Smoke:"); msg += sys.sensors.smokeRaw;
     msg += F(" | Flame:"); msg += sys.sensors.flameDetected ? F("YES") : F("NO");
     msg += F(" | WiFi:");  msg += sys.wifiConnected ? sys.wifiSSID : String(F("OFF"));
-    msg += F(" | IP:");    msg += sys.localIP;
+    msg += F(" | Blynk:"); msg += sys.blynkConnected ? F("ON") : F("OFF");
     logToSerial(msg);
   }
 }
 
 // ============================================================================
 //  setupWifi()
-// ----------------------------------------------------------------------------
-//  1. Load saved credentials from NVS.
-//  2. Try to connect with a 15-second timeout.
-//  3. If connection fails OR no credentials saved → enter interactive setup.
-//  4. Interactive setup: scan networks, user picks SSID + types password
-//     via Serial Monitor (set to "No line ending" or "Newline").
 // ============================================================================
 void setupWifi() {
   lcd.clear();
   lcd.setCursor(0, 0); lcd.print(F("WiFi Setup...  "));
 
-  // Load saved credentials
-  prefs.begin(NVS_NAMESPACE, true);  // read-only
+  prefs.begin(NVS_NAMESPACE, true);
   String savedSSID = prefs.getString(NVS_KEY_SSID, "");
   String savedPass = prefs.getString(NVS_KEY_PASS, "");
   prefs.end();
 
   if (savedSSID.length() > 0) {
-    Serial.print(F("[WiFi] Saved network found: "));
+    Serial.print(F("[WiFi] Saved network: "));
     Serial.println(savedSSID);
     lcd.setCursor(0, 1);
     lcd.print(savedSSID.substring(0, 16));
-
     tryConnectWifi(savedSSID, savedPass);
-
     if (sys.wifiConnected) return;
-
-    Serial.println(F("[WiFi] Saved credentials failed. Starting scan..."));
+    Serial.println(F("[WiFi] Saved credentials failed. Scanning…"));
   } else {
-    Serial.println(F("[WiFi] No saved credentials. Starting scan..."));
+    Serial.println(F("[WiFi] No saved credentials. Scanning…"));
   }
 
-  // No saved creds or connection failed — interactive setup
   scanAndConfigureWifi();
 }
 
@@ -292,8 +311,7 @@ void tryConnectWifi(const String& ssid, const String& pass) {
 
   lcd.clear();
   lcd.setCursor(0, 0); lcd.print(F("Connecting...  "));
-  lcd.setCursor(0, 1);
-  lcd.print(ssid.substring(0, 16));
+  lcd.setCursor(0, 1); lcd.print(ssid.substring(0, 16));
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid.c_str(), pass.c_str());
@@ -309,7 +327,6 @@ void tryConnectWifi(const String& ssid, const String& pass) {
     }
     delay(500);
     Serial.print('.');
-    // Animate LCD row 1
     lcd.setCursor(dots % 16, 1);
     lcd.print('.');
     dots++;
@@ -326,36 +343,61 @@ void tryConnectWifi(const String& ssid, const String& pass) {
   lcd.clear();
   lcd.setCursor(0, 0); lcd.print(F("WiFi Connected!"));
   lcd.setCursor(0, 1); lcd.print(sys.localIP.substring(0, 16));
-  delay(2000);
+  delay(1500);
+
+  // Blynk connects after WiFi is up
+  connectBlynk();
+}
+
+// ============================================================================
+//  connectBlynk()
+// ----------------------------------------------------------------------------
+//  Uses Blynk.config() + Blynk.connect() so WiFi management stays in our
+//  hands. Does NOT call Blynk.begin() to avoid it taking over WiFi.
+// ============================================================================
+void connectBlynk() {
+  Serial.print(F("[Blynk] Connecting to blynk.cloud…"));
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print(F("Blynk connect.."));
+
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+  // 6-second non-blocking connect attempt
+  sys.blynkConnected = Blynk.connect(6000);
+
+  if (sys.blynkConnected) {
+    Serial.println(F(" OK"));
+    lcd.setCursor(0, 1); lcd.print(F("Blynk: OK      "));
+    delay(1200);
+  } else {
+    Serial.println(F(" FAILED"));
+    Serial.println(F("[Blynk] Will retry in background via Blynk.run()."));
+    lcd.setCursor(0, 1); lcd.print(F("Blynk: offline "));
+    delay(1200);
+  }
 }
 
 // ============================================================================
 //  scanAndConfigureWifi()
-// ----------------------------------------------------------------------------
-//  Scans for networks, prints a numbered list, waits for user to type the
-//  network number and then the password in Serial Monitor.
-//  Saves to NVS on successful connection.
 // ============================================================================
 void scanAndConfigureWifi() {
   Serial.println(F("\n╔═══════════════════════════════════╗"));
   Serial.println(F("║     WiFi Network Configuration    ║"));
   Serial.println(F("╚═══════════════════════════════════╝"));
   Serial.println(F("Open Serial Monitor at 115200 baud."));
-  Serial.println(F("Scanning for networks...\n"));
+  Serial.println(F("Scanning for networks…\n"));
 
   lcd.clear();
   lcd.setCursor(0, 0); lcd.print(F("Scanning WiFi.."));
 
   int n = WiFi.scanNetworks();
-
   if (n == 0) {
-    Serial.println(F("[WiFi] No networks found. Skipping WiFi setup."));
+    Serial.println(F("[WiFi] No networks found. Skipping."));
     lcd.setCursor(0, 1); lcd.print(F("No networks!   "));
     delay(2000);
     return;
   }
 
-  // Print numbered list
   Serial.println(F("Available networks:"));
   Serial.println(F("───────────────────────────────────"));
   for (int i = 0; i < n; i++) {
@@ -375,14 +417,12 @@ void scanAndConfigureWifi() {
   lcd.setCursor(0, 0); lcd.print(F("Check Serial   "));
   lcd.setCursor(0, 1); lcd.print(F("Pick network # "));
 
-  // ── Wait for network number ───────────────────────────────────────────────
   Serial.print(F("\nEnter network number (1–"));
   Serial.print(n);
   Serial.println(F(") or 0 to skip: "));
 
   String inputNum = "";
   unsigned long waitStart = millis();
-  // Wait up to 60 seconds for input
   while (millis() - waitStart < 60000UL) {
     if (Serial.available()) {
       char c = Serial.read();
@@ -390,7 +430,7 @@ void scanAndConfigureWifi() {
         if (inputNum.length() > 0) break;
       } else {
         inputNum += c;
-        Serial.print(c);  // echo
+        Serial.print(c);
       }
     }
   }
@@ -398,7 +438,7 @@ void scanAndConfigureWifi() {
 
   int choice = inputNum.toInt();
   if (choice < 1 || choice > n) {
-    Serial.println(F("[WiFi] Skipping WiFi setup."));
+    Serial.println(F("[WiFi] Skipping."));
     lcd.clear();
     lcd.setCursor(0, 0); lcd.print(F("WiFi Skipped   "));
     delay(1500);
@@ -411,7 +451,6 @@ void scanAndConfigureWifi() {
   Serial.print(F("Selected: "));
   Serial.println(chosenSSID);
 
-  // ── Wait for password ─────────────────────────────────────────────────────
   String password = "";
   if (!isOpen) {
     Serial.print(F("Enter password for \""));
@@ -423,34 +462,30 @@ void scanAndConfigureWifi() {
     lcd.setCursor(0, 1); lcd.print(F("in Serial Mon. "));
 
     waitStart = millis();
-    while (millis() - waitStart < 120000UL) {  // 2-minute timeout
+    while (millis() - waitStart < 120000UL) {
       if (Serial.available()) {
         char c = Serial.read();
         if (c == '\n' || c == '\r') {
           if (password.length() > 0) break;
         } else {
           password += c;
-          Serial.print('*');  // mask password in terminal
+          Serial.print('*');
         }
       }
     }
     Serial.println();
   }
 
-  // ── Try connecting ─────────────────────────────────────────────────────────
   tryConnectWifi(chosenSSID, password);
 
   if (sys.wifiConnected) {
-    // Save credentials to NVS
-    prefs.begin(NVS_NAMESPACE, false);  // read-write
+    prefs.begin(NVS_NAMESPACE, false);
     prefs.putString(NVS_KEY_SSID, chosenSSID);
     prefs.putString(NVS_KEY_PASS, password);
     prefs.end();
-    Serial.println(F("[NVS] Credentials saved to flash."));
-    Serial.println(F("[NVS] They will be used automatically on next boot."));
+    Serial.println(F("[NVS] Credentials saved. Auto-connect on next boot."));
   } else {
-    Serial.println(F("[WiFi] Connection failed. Running without WiFi."));
-    Serial.println(F("[WiFi] Type 'WIFI' in Serial Monitor to reconfigure."));
+    Serial.println(F("[WiFi] Failed. Running without WiFi."));
     lcd.clear();
     lcd.setCursor(0, 0); lcd.print(F("WiFi Failed    "));
     lcd.setCursor(0, 1); lcd.print(F("Running offline"));
@@ -465,7 +500,7 @@ void readSensors() {
   if (sys.simMode) {
     sys.sensors.temperature   = 60.0f;
     sys.sensors.humidity      = 30.0f;
-    sys.sensors.smokeRaw      = 600;   // above 500 threshold → triggers warning
+    sys.sensors.smokeRaw      = 600;
     sys.sensors.flameDetected = true;
     return;
   }
@@ -473,15 +508,14 @@ void readSensors() {
   float t = dht.readTemperature();
   float h = dht.readHumidity();
   if (isnan(t) || isnan(h)) {
-    logToSerial(F("WARN: DHT11 read failed — keeping last valid data."));
+    logToSerial(F("WARN: DHT11 read failed — keeping last valid reading."));
   } else {
     sys.sensors.temperature = t;
     sys.sensors.humidity    = h;
   }
 
-  // ESP32 ADC is 12-bit (0–4095); MQ-2 output scales accordingly
   sys.sensors.smokeRaw      = analogRead(PIN_SMOKE);
-  sys.sensors.flameDetected = (digitalRead(PIN_FLAME) == LOW);  // Active LOW
+  sys.sensors.flameDetected = (digitalRead(PIN_FLAME) == LOW);
 }
 
 // ============================================================================
@@ -511,6 +545,53 @@ void processFusion() {
     msg += F(" Flame=");  msg += s.flameDetected ? F("YES") : F("NO");
     logToSerial(msg);
   }
+
+  // ── Send Blynk event on alarm level change (real mode only) ────────────────
+  if (sys.alarmLevel != blynkLastLevel && sys.blynkConnected && !sys.simMode) {
+    sendBlynkEvent(sys.alarmLevel);
+  }
+  blynkLastLevel = sys.alarmLevel;
+}
+
+// ============================================================================
+//  sendBlynkEvent()
+// ----------------------------------------------------------------------------
+//  Triggers push notification on the phone via a Blynk Event.
+//  Events must be created in the Blynk console with these exact codes.
+// ============================================================================
+void sendBlynkEvent(uint8_t level) {
+  const SensorData& s = sys.sensors;
+
+  if (level == 2) {
+    // DANGER: full alarm — fire_alert event
+    String desc = F("DANGER: Fire! T=");
+    desc += isnan(s.temperature) ? String(F("ERR")) : String(s.temperature, 1) + String(F("C"));
+    desc += F(" Smoke="); desc += s.smokeRaw;
+    desc += F(" Flame="); desc += s.flameDetected ? F("YES") : F("NO");
+    Blynk.logEvent("fire_alert", desc);
+    logToSerial(F("[Blynk] fire_alert event sent."));
+
+  } else if (level == 1) {
+    // WARNING: threshold crossed
+    String desc = F("WARNING: Threshold exceeded. Smoke=");
+    desc += s.smokeRaw;
+    desc += F(" T=");
+    desc += isnan(s.temperature) ? String(F("ERR")) : String(s.temperature, 1) + String(F("C"));
+    Blynk.logEvent("smoke_warning", desc);
+    logToSerial(F("[Blynk] smoke_warning event sent."));
+  }
+  // level == 0 (back to safe) — no notification needed
+}
+
+// ============================================================================
+//  pushBlynkData()  — update virtual pins in Blynk dashboard
+// ============================================================================
+void pushBlynkData() {
+  if (!isnan(sys.sensors.temperature))
+    Blynk.virtualWrite(VPIN_TEMP,  sys.sensors.temperature);
+  Blynk.virtualWrite(VPIN_SMOKE, sys.sensors.smokeRaw);
+  Blynk.virtualWrite(VPIN_FLAME, sys.sensors.flameDetected ? 1 : 0);
+  Blynk.virtualWrite(VPIN_LEVEL, sys.alarmLevel);
 }
 
 // ============================================================================
@@ -526,7 +607,6 @@ void updateDisplay() {
     dtostrf(sys.sensors.temperature, 5, 1, tempBuf);
 
   char row0[17];
-
   if (sys.alarmLevel == 0) {
     snprintf(row0, sizeof(row0), "SAFE  T:%sC  ", tempBuf);
     lcd.setCursor(0, 0); lcd.print(row0);
@@ -551,14 +631,7 @@ void printLcdRow1() {
 }
 
 // ============================================================================
-//  handleAlarms()
-// ----------------------------------------------------------------------------
-//  FIXED BUZZER — 3-phase siren:
-//    Phase 0 (400 ms): TONE_HIGH played
-//    Phase 1 (300 ms): TONE_LOW  played
-//    Phase 2 (300 ms): SILENT    — this is what was missing before
-//
-//  The silence gap makes the alarm pulse instead of screech continuously.
+//  handleAlarms()  — 3-phase siren + blink
 // ============================================================================
 void handleAlarms() {
   unsigned long now = millis();
@@ -566,14 +639,12 @@ void handleAlarms() {
   if (sys.alarmLevel < 2) {
     buzzerOff();
     setRelay(false);
-    sirenPhase = 0;  // reset phase so next alarm starts from HIGH
+    sirenPhase = 0;
     return;
   }
 
-  // ── DANGER ───────────────────────────────────────────────────────────────
   setRelay(!sys.simMode);
 
-  // ── Red LED + LCD row 0 blink (500 ms) ───────────────────────────────────
   if (now - lastBlinkTick >= INTERVAL_BLINK) {
     lastBlinkTick = now;
     lcdBlinkState = !lcdBlinkState;
@@ -583,28 +654,26 @@ void handleAlarms() {
     printLcdRow1();
   }
 
-  // ── 3-phase siren ────────────────────────────────────────────────────────
   unsigned long phaseDur;
   switch (sirenPhase) {
-    case 0: phaseDur = SIREN_PHASE_0_MS; break;
-    case 1: phaseDur = SIREN_PHASE_1_MS; break;
+    case 0:  phaseDur = SIREN_PHASE_0_MS; break;
+    case 1:  phaseDur = SIREN_PHASE_1_MS; break;
     default: phaseDur = SIREN_PHASE_2_MS; break;
   }
 
   if (now - lastToneTick >= phaseDur) {
     lastToneTick = now;
     sirenPhase   = (sirenPhase + 1) % 3;
-
     switch (sirenPhase) {
-      case 0: buzzerTone(TONE_HIGH); break;   // start of next cycle
-      case 1: buzzerTone(TONE_LOW);  break;   // drop to low
-      case 2: buzzerOff();           break;   // silence gap
+      case 0: buzzerTone(TONE_HIGH); break;
+      case 1: buzzerTone(TONE_LOW);  break;
+      case 2: buzzerOff();           break;
     }
   }
 }
 
 // ============================================================================
-//  checkButton()
+//  checkButton() + Serial commands
 // ============================================================================
 void checkButton() {
   unsigned long now     = millis();
@@ -615,11 +684,9 @@ void checkButton() {
   if (reading == LOW && buttonLastState == HIGH) {
     lastButtonCheck = now;
     sys.simMode = !sys.simMode;
-
     logToSerial(sys.simMode
       ? F("SIM MODE ON  — relay blocked, fire values injected.")
       : F("SIM MODE OFF — returning to real sensors."));
-
     if (!sys.simMode) {
       buzzerOff();
       setRelay(false);
@@ -629,42 +696,45 @@ void checkButton() {
   }
   buttonLastState = reading;
 
-  // ── Serial command listener (type WIFI + Enter to reconfigure) ───────────
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
     cmd.toUpperCase();
     if (cmd == "WIFI") {
-      Serial.println(F("\n[CMD] Reconfiguring WiFi..."));
+      Serial.println(F("\n[CMD] Reconfiguring WiFi…"));
       scanAndConfigureWifi();
     } else if (cmd == "FORGET") {
       prefs.begin(NVS_NAMESPACE, false);
       prefs.clear();
       prefs.end();
-      Serial.println(F("[NVS] Saved WiFi credentials erased. Restart to reconfigure."));
+      Serial.println(F("[NVS] WiFi credentials erased. Restart to reconfigure."));
     } else if (cmd == "IP") {
       Serial.print(F("[WiFi] IP: "));
       Serial.println(sys.wifiConnected ? sys.localIP : F("Not connected"));
+    } else if (cmd == "BLYNK") {
+      Serial.print(F("[Blynk] Connected: "));
+      Serial.println(sys.blynkConnected ? F("YES") : F("NO"));
     }
   }
 }
 
 // ============================================================================
-//  sendSensorData()  —  JSON line for web dashboard Serial bridge
+//  sendSensorData()  — JSON line for web dashboard Serial bridge
 // ============================================================================
 void sendSensorData() {
   Serial.print(F("{\"temperature\":"));
   if (isnan(sys.sensors.temperature)) Serial.print(F("null"));
   else Serial.print(sys.sensors.temperature, 1);
-  Serial.print(F(",\"smoke\":"));      Serial.print(sys.sensors.smokeRaw);
-  Serial.print(F(",\"flame\":"));      Serial.print(sys.sensors.flameDetected ? F("true") : F("false"));
-  Serial.print(F(",\"level\":"));      Serial.print(sys.alarmLevel);
-  Serial.print(F(",\"pts\":"));        Serial.print(sys.fusion.points);
-  Serial.print(F(",\"sim\":"));        Serial.print(sys.simMode ? F("true") : F("false"));
-  Serial.print(F(",\"uptime\":\""));   Serial.print(uptimeStr());
-  Serial.print(F("\",\"wifi\":"));     Serial.print(sys.wifiConnected ? F("true") : F("false"));
-  Serial.print(F(",\"ip\":\""));       Serial.print(sys.localIP);
-  Serial.println(F("\"}"));
+  Serial.print(F(",\"smoke\":"));       Serial.print(sys.sensors.smokeRaw);
+  Serial.print(F(",\"flame\":"));       Serial.print(sys.sensors.flameDetected ? F("true") : F("false"));
+  Serial.print(F(",\"level\":"));       Serial.print(sys.alarmLevel);
+  Serial.print(F(",\"pts\":"));         Serial.print(sys.fusion.points);
+  Serial.print(F(",\"sim\":"));         Serial.print(sys.simMode ? F("true") : F("false"));
+  Serial.print(F(",\"uptime\":\""));    Serial.print(uptimeStr());
+  Serial.print(F("\",\"wifi\":"));      Serial.print(sys.wifiConnected ? F("true") : F("false"));
+  Serial.print(F(",\"ip\":\""));        Serial.print(sys.localIP);
+  Serial.print(F("\",\"blynk\":"));     Serial.print(sys.blynkConnected ? F("true") : F("false"));
+  Serial.println(F("}"));
 }
 
 // ============================================================================
@@ -678,20 +748,12 @@ void setLEDs(uint8_t level) {
 }
 
 void setRelay(bool active) {
-  // Active LOW: LOW = coil ON = fan running
-  digitalWrite(PIN_RELAY, active ? LOW : HIGH);
+  digitalWrite(PIN_RELAY, active ? LOW : HIGH);  // Active LOW
   sys.relayActive = active;
 }
 
-// ESP32 core v3.x: ledcWriteTone(pin, freq) sets frequency + 50% duty.
-// ledcWriteTone(pin, 0) stops output cleanly.
-void buzzerTone(uint32_t freq) {
-  ledcWriteTone(PIN_BUZZER, freq);
-}
-
-void buzzerOff() {
-  ledcWriteTone(PIN_BUZZER, 0);
-}
+void buzzerTone(uint32_t freq) { ledcWriteTone(PIN_BUZZER, freq); }
+void buzzerOff()               { ledcWriteTone(PIN_BUZZER, 0);    }
 
 String uptimeStr() {
   unsigned long s = millis() / 1000UL;
