@@ -6,11 +6,10 @@ import { ReadlineParser } from "@serialport/parser-readline";
 const app = express();
 const PORT = 3001;
 
-// Enable CORS for React app
 app.use(cors());
 app.use(express.json());
 
-// Store latest sensor data
+// ── Sensor state ──────────────────────────────────────────────────────────────
 let sensorData = {
   temperature: 24,
   smoke: 87,
@@ -19,171 +18,205 @@ let sensorData = {
   pts: 0,
   sim: false,
   uptime: "00:00:00",
+  connected: false,
 };
 
-let serialPort;
-let parser;
-let isConnected = false;
+let serialPort = null;
+let reconnectTimer = null;
 
-// Function to initialize serial connection
-async function initializeSerialPort() {
+// ── Thresholds (must match Arduino sketch) ────────────────────────────────────
+const T_THRESH = 45;
+const S_THRESH = 350;
+
+// ── Find Arduino port using SerialPort.list() ─────────────────────────────────
+async function findArduinoPort() {
+  if (process.env.ARDUINO_PORT) {
+    console.log(`Using manually specified port: ${process.env.ARDUINO_PORT}`);
+    return process.env.ARDUINO_PORT;
+  }
+
   try {
-    // Try user-specified port first
-    let portPath = process.env.ARDUINO_PORT;
-
-    // Try common macOS patterns if no port is specified
-    if (!portPath) {
-      const commonPorts = [
-        "/dev/tty.usbmodem14201",
-        "/dev/tty.usbmodem14101",
-        "/dev/tty.usbmodem14001",
-        "/dev/tty.usbmodem13101",
-        "/dev/tty.usbmodem11101",
-        "/dev/tty.usbmodem11001",
-        "/dev/tty.usbserial-0001",
-        "/dev/ttyACM0",
-        "COM3",
-      ];
-
-      for (const port of commonPorts) {
-        try {
-          await new Promise((resolve, reject) => {
-            const test = new SerialPort({ path: port, baudRate: 9600 });
-            test.on("open", () => {
-              test.close();
-              resolve();
-            });
-            test.on("error", reject);
-            // Timeout after 1 second
-            setTimeout(() => reject(new Error("Timeout")), 1000);
-          });
-          portPath = port;
-          break;
-        } catch (e) {
-          // Port not available, continue
-        }
-      }
-    }
-
-    if (!portPath) {
-      console.warn("⚠️  No Arduino found. Running in SIMULATION MODE.");
-      console.log("Common Arduino ports (macOS): /dev/tty.usbmodemXXXX");
+    const ports = await SerialPort.list();
+    console.log("\nAvailable serial ports:");
+    ports.forEach((p) =>
       console.log(
-        "To connect an Arduino, set: export ARDUINO_PORT=/dev/tty.usbmodemXXXX",
+        `  ${p.path} — ${p.manufacturer || "unknown"} ${p.serialNumber ? `[${p.serialNumber}]` : ""}`,
+      ),
+    );
+
+    const arduino = ports.find((p) => {
+      const mfr = (p.manufacturer || "").toLowerCase();
+      const path = (p.path || "").toLowerCase();
+      return (
+        mfr.includes("arduino") ||
+        mfr.includes("wch") ||
+        mfr.includes("silicon") ||
+        mfr.includes("ftdi") ||
+        path.includes("usbmodem") ||
+        path.includes("usbserial") ||
+        path.includes("ttyacm") ||
+        path.includes("ttyusb")
       );
-      console.log("Then run: npm run server");
-      return;
+    });
+
+    if (arduino) {
+      console.log(`\n✅ Arduino found: ${arduino.path}`);
+      return arduino.path;
     }
 
-    serialPort = new SerialPort({ path: portPath, baudRate: 9600 });
-    parser = serialPort.pipe(new ReadlineParser({ delimiter: "\n" }));
-
-    serialPort.on("open", () => {
-      isConnected = true;
-      console.log(`✅ Connected to Arduino on ${portPath}`);
-    });
-
-    serialPort.on("error", (error) => {
-      isConnected = false;
-      console.error("❌ Serial port error:", error.message);
-    });
-
-    parser.on("data", (line) => {
-      try {
-        const data = JSON.parse(line.trim());
-        sensorData = { ...sensorData, ...data };
-        console.log("📡 Received data:", sensorData);
-      } catch (e) {
-        console.log("📝 Arduino log:", line.trim());
-      }
-    });
-  } catch (error) {
-    console.warn("⚠️  Could not initialize serial port:", error.message);
-    console.log(
-      "Running in SIMULATION MODE. Dashboard will show default values.",
-    );
+    console.warn("\n⚠️  No Arduino detected. Running in Simulation Mode.");
+    console.log("Tip: set ARDUINO_PORT=/dev/tty.usbmodemXXXX and restart.");
+    return null;
+  } catch (err) {
+    console.error("Failed to list serial ports:", err.message);
+    return null;
   }
 }
 
-// Initialize on startup
-initializeSerialPort();
-
-// API endpoint for sensor data
-app.get("/api/sensors", (req, res) => {
-  res.json(sensorData);
-});
-
-// API endpoint to check Arduino connection status
-app.get("/api/status", (req, res) => {
-  res.json({ connected: isConnected, sensorData });
-});
-
-// API endpoint to update simulation data
-app.post("/api/sim/data", (req, res) => {
-  const { temperature, smoke, flame } = req.body;
-  if (sensorData.sim) {
-    if (temperature !== undefined) sensorData.temperature = temperature;
-    if (smoke !== undefined) sensorData.smoke = smoke;
-    if (flame !== undefined) sensorData.flame = flame;
-    updateFusionLevel();
+// ── Open serial connection ─────────────────────────────────────────────────────
+async function connectToArduino() {
+  if (serialPort && serialPort.isOpen) {
+    try {
+      serialPort.close();
+    } catch (_) {}
   }
-  res.json({ success: true, sensorData });
+
+  const portPath = await findArduinoPort();
+  if (!portPath) {
+    sensorData.connected = false;
+    return;
+  }
+
+  try {
+    serialPort = new SerialPort({ path: portPath, baudRate: 9600 });
+    const parser = serialPort.pipe(new ReadlineParser({ delimiter: "\n" }));
+
+    serialPort.on("open", () => {
+      sensorData.connected = true;
+      console.log(`\n🔌 Connected: ${portPath}`);
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    });
+
+    serialPort.on("close", () => {
+      sensorData.connected = false;
+      console.warn("⚠️  Port closed. Reconnecting in 5s…");
+      scheduleReconnect();
+    });
+
+    serialPort.on("error", (err) => {
+      sensorData.connected = false;
+      console.error("❌ Serial error:", err.message);
+      scheduleReconnect();
+    });
+
+    parser.on("data", (line) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("{")) {
+        console.log("📟 Arduino:", trimmed);
+        return;
+      }
+      try {
+        const parsed = JSON.parse(trimmed);
+        sensorData = {
+          ...sensorData,
+          temperature: parsed.temperature ?? sensorData.temperature,
+          smoke: parsed.smoke ?? sensorData.smoke,
+          flame: parsed.flame ?? sensorData.flame,
+          level: parsed.level ?? sensorData.level,
+          pts: parsed.pts ?? sensorData.pts,
+          sim: parsed.sim ?? sensorData.sim,
+          uptime: parsed.uptime ?? sensorData.uptime,
+          connected: true,
+        };
+      } catch (_) {
+        /* malformed line — ignore */
+      }
+    });
+  } catch (err) {
+    sensorData.connected = false;
+    console.error("❌ Could not open port:", err.message);
+    scheduleReconnect();
+  }
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectToArduino();
+  }, 5000);
+}
+
+// ── Fusion (used only for sim-mode API overrides) ─────────────────────────────
+function recalcFusion() {
+  const pts =
+    (sensorData.temperature > T_THRESH ? 1 : 0) +
+    (sensorData.smoke > S_THRESH ? 1 : 0) +
+    (sensorData.flame ? 1 : 0);
+  sensorData.pts = pts;
+  sensorData.level = pts >= 2 ? 2 : pts === 1 ? 1 : 0;
+}
+
+// ── API routes ────────────────────────────────────────────────────────────────
+app.get("/api/sensors", (_req, res) => res.json(sensorData));
+
+app.get("/api/status", (_req, res) =>
+  res.json({ connected: sensorData.connected, port: serialPort?.path ?? null }),
+);
+
+app.get("/api/ports", async (_req, res) => {
+  try {
+    res.json(await SerialPort.list());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// API endpoint to toggle simulation mode
-app.post("/api/sim/toggle", (req, res) => {
+app.post("/api/sim/data", (req, res) => {
+  if (!sensorData.sim)
+    return res.status(400).json({ error: "Simulation mode is not active" });
+  const { temperature, smoke, flame } = req.body;
+  if (temperature !== undefined) sensorData.temperature = Number(temperature);
+  if (smoke !== undefined) sensorData.smoke = Number(smoke);
+  if (flame !== undefined) sensorData.flame = Boolean(flame);
+  recalcFusion();
+  res.json({ ok: true, sensorData });
+});
+
+app.post("/api/sim/toggle", (_req, res) => {
   sensorData.sim = !sensorData.sim;
-  console.log(`🎮 Simulation mode: ${sensorData.sim ? "ON" : "OFF"}`);
-  res.json({ success: true, sim: sensorData.sim });
+  if (!sensorData.sim) {
+    sensorData.temperature = 24;
+    sensorData.smoke = 87;
+    sensorData.flame = false;
+    recalcFusion();
+  }
+  console.log(`🎮 Simulation: ${sensorData.sim ? "ON" : "OFF"}`);
+  res.json({ ok: true, sim: sensorData.sim });
 });
 
-// API endpoint to reset system
-app.post("/api/reset", (req, res) => {
-  sensorData = {
+app.post("/api/reset", (_req, res) => {
+  Object.assign(sensorData, {
     temperature: 24,
     smoke: 87,
     flame: false,
     level: 0,
     pts: 0,
-    sim: sensorData.sim,
     uptime: "00:00:00",
-  };
-  console.log("🔄 System reset");
-  res.json({ success: true, sensorData });
+  });
+  console.log("🔄 Reset");
+  res.json({ ok: true, sensorData });
 });
 
-// Function to update fusion level (fire detection logic)
-function updateFusionLevel() {
-  const T_THRESH = 45;
-  const S_THRESH = 350;
-
-  let pts = 0;
-  if (sensorData.temperature > T_THRESH) pts++;
-  if (sensorData.smoke > S_THRESH) pts++;
-  if (sensorData.flame) pts++;
-
-  sensorData.pts = pts;
-
-  if (pts >= 2) {
-    sensorData.level = 2; // DANGER
-  } else if (pts === 1) {
-    sensorData.level = 1; // WARNING
-  } else {
-    sensorData.level = 0; // SAFE
-  }
-}
-
-// Start server
-app.listen(PORT, () => {
-  console.log("");
+// ── Start ─────────────────────────────────────────────────────────────────────
+app.listen(PORT, async () => {
   console.log("╔════════════════════════════════════════╗");
-  console.log("║  Fire Detection System Backend Server  ║");
+  console.log("║  Fire Detection System — Backend v2    ║");
   console.log("╚════════════════════════════════════════╝");
-  console.log("");
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
-  console.log(`📊 API endpoint: http://localhost:${PORT}/api/sensors`);
-  console.log(
-    `📡 Arduino connected: ${isConnected ? "✅ YES" : "❌ NO (Simulation Mode)"}`,
-  );
-  console.log("");
+  console.log(`\n🚀 API  →  http://localhost:${PORT}/api/sensors`);
+  console.log(`🔌 Ports →  http://localhost:${PORT}/api/ports\n`);
+  await connectToArduino();
 });
