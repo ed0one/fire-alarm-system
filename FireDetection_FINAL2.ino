@@ -31,9 +31,9 @@
 
 // ── Blynk credentials (replace with your own from blynk.cloud) ───────────────
 // These MUST be defined BEFORE the Blynk include.
-#define BLYNK_TEMPLATE_ID    "TMPL_XXXXXXXXXX"       // e.g. "TMPL_Ab12Cd34Ef"
-#define BLYNK_TEMPLATE_NAME  "Fire Detection System"
-#define BLYNK_AUTH_TOKEN     "YOUR_BLYNK_AUTH_TOKEN"  // 32-char token from blynk.cloud
+#define BLYNK_TEMPLATE_ID "TMPL4dmW8pOjR"
+#define BLYNK_TEMPLATE_NAME "notify fire alarm"
+#define BLYNK_AUTH_TOKEN "4tXML9n4uCwtbIGCPw20kBQJt7WJDXgk"  // 32-char token from blynk.cloud
 
 // ── Libraries ────────────────────────────────────────────────────────────────
 #include <Wire.h>

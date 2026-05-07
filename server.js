@@ -7,7 +7,8 @@ const app = express();
 const PORT = 3001;
 
 // Set BLYNK_TOKEN env var to enable server-side push notifications as backup
-const BLYNK_TOKEN = process.env.BLYNK_TOKEN || "";
+const BLYNK_TOKEN =
+  process.env.BLYNK_TOKEN || "4tXML9n4uCwtbIGCPw20kBQJt7WJDXgk";
 
 app.use(cors());
 app.use(express.json());
@@ -15,22 +16,22 @@ app.use(express.json());
 // ── Sensor state ──────────────────────────────────────────────────────────────
 let sensorData = {
   temperature: 24,
-  smoke:       87,
-  flame:       false,
-  level:       0,
-  pts:         0,
-  sim:         false,
-  uptime:      "00:00:00",
-  connected:   false,
-  wifi:        false,
-  ip:          "—",
-  blynk:       false,
+  smoke: 87,
+  flame: false,
+  level: 0,
+  pts: 0,
+  sim: false,
+  uptime: "00:00:00",
+  connected: false,
+  wifi: false,
+  ip: "—",
+  blynk: false,
   lastNotification: null,
 };
 
-let serialPort    = null;
+let serialPort = null;
 let reconnectTimer = null;
-let prevLevel     = 0;  // for alarm-transition detection
+let prevLevel = 0; // for alarm-transition detection
 
 // ── Thresholds — must match ESP32 sketch (12-bit ADC: 0–4095) ────────────────
 const T_THRESH = 45;
@@ -41,21 +42,26 @@ async function sendBlynkNotification(level, data) {
   if (!BLYNK_TOKEN) return;
 
   const event = level === 2 ? "fire_alert" : "smoke_warning";
-  const tempStr = typeof data.temperature === "number"
-    ? data.temperature.toFixed(1)
-    : "ERR";
-  const desc = level === 2
-    ? `DANGER: Fire detected! T=${tempStr}°C Smoke=${data.smoke}`
-    : `WARNING: Sensor threshold exceeded. T=${tempStr}°C Smoke=${data.smoke}`;
+  const tempStr =
+    typeof data.temperature === "number" ? data.temperature.toFixed(1) : "ERR";
+  const desc =
+    level === 2
+      ? `DANGER: Fire detected! T=${tempStr}°C Smoke=${data.smoke}`
+      : `WARNING: Sensor threshold exceeded. T=${tempStr}°C Smoke=${data.smoke}`;
 
   try {
-    const url = `https://blynk.cloud/external/api/logEvent` +
+    const url =
+      `https://blynk.cloud/external/api/logEvent` +
       `?token=${encodeURIComponent(BLYNK_TOKEN)}` +
       `&code=${event}` +
       `&description=${encodeURIComponent(desc)}`;
     const res = await fetch(url);
-    const ts  = new Date().toISOString();
-    sensorData.lastNotification = { ts, event, status: res.ok ? "sent" : "failed" };
+    const ts = new Date().toISOString();
+    sensorData.lastNotification = {
+      ts,
+      event,
+      status: res.ok ? "sent" : "failed",
+    };
     console.log(`🔔 Blynk [${event}]: HTTP ${res.status}`);
   } catch (err) {
     console.error("❌ Blynk notification failed:", err.message);
@@ -84,18 +90,18 @@ async function findESP32Port() {
     );
 
     const esp32 = ports.find((p) => {
-      const mfr  = (p.manufacturer || "").toLowerCase();
+      const mfr = (p.manufacturer || "").toLowerCase();
       const path = (p.path || "").toLowerCase();
       return (
-        mfr.includes("silicon") ||   // CP210x — most common ESP32 USB chip
-        mfr.includes("cp210")  ||
-        mfr.includes("ch340")  ||   // CH340G — cheap ESP32 clone boards
-        mfr.includes("wch")    ||   // WCH (CH340 vendor)
+        mfr.includes("silicon") || // CP210x — most common ESP32 USB chip
+        mfr.includes("cp210") ||
+        mfr.includes("ch340") || // CH340G — cheap ESP32 clone boards
+        mfr.includes("wch") || // WCH (CH340 vendor)
         mfr.includes("arduino") ||
-        mfr.includes("ftdi")   ||
+        mfr.includes("ftdi") ||
         path.includes("usbmodem") ||
         path.includes("usbserial") ||
-        path.includes("ttyacm")    ||
+        path.includes("ttyacm") ||
         path.includes("ttyusb")
       );
     });
@@ -117,7 +123,9 @@ async function findESP32Port() {
 // ── Open serial connection (ESP32 @ 115200 baud) ──────────────────────────────
 async function connectToESP32() {
   if (serialPort && serialPort.isOpen) {
-    try { serialPort.close(); } catch (_) {}
+    try {
+      serialPort.close();
+    } catch (_) {}
   }
 
   const portPath = await findESP32Port();
@@ -134,7 +142,10 @@ async function connectToESP32() {
     serialPort.on("open", () => {
       sensorData.connected = true;
       console.log(`\n🔌 Connected: ${portPath} @ 115200 baud`);
-      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
     });
 
     serialPort.on("close", () => {
@@ -156,7 +167,7 @@ async function connectToESP32() {
         return;
       }
       try {
-        const parsed   = JSON.parse(trimmed);
+        const parsed = JSON.parse(trimmed);
         const newLevel = parsed.level ?? sensorData.level;
 
         // Send Blynk notification on alarm escalation (not in sim mode)
@@ -168,18 +179,20 @@ async function connectToESP32() {
         sensorData = {
           ...sensorData,
           temperature: parsed.temperature ?? sensorData.temperature,
-          smoke:       parsed.smoke       ?? sensorData.smoke,
-          flame:       parsed.flame       ?? sensorData.flame,
-          level:       newLevel,
-          pts:         parsed.pts         ?? sensorData.pts,
-          sim:         parsed.sim         ?? sensorData.sim,
-          uptime:      parsed.uptime      ?? sensorData.uptime,
-          wifi:        parsed.wifi        ?? sensorData.wifi,
-          ip:          parsed.ip          ?? sensorData.ip,
-          blynk:       parsed.blynk       ?? sensorData.blynk,
-          connected:   true,
+          smoke: parsed.smoke ?? sensorData.smoke,
+          flame: parsed.flame ?? sensorData.flame,
+          level: newLevel,
+          pts: parsed.pts ?? sensorData.pts,
+          sim: parsed.sim ?? sensorData.sim,
+          uptime: parsed.uptime ?? sensorData.uptime,
+          wifi: parsed.wifi ?? sensorData.wifi,
+          ip: parsed.ip ?? sensorData.ip,
+          blynk: parsed.blynk ?? sensorData.blynk,
+          connected: true,
         };
-      } catch (_) { /* malformed JSON line — ignore */ }
+      } catch (_) {
+        /* malformed JSON line — ignore */
+      }
     });
   } catch (err) {
     sensorData.connected = false;
@@ -202,7 +215,7 @@ function recalcFusion() {
     (sensorData.temperature > T_THRESH ? 1 : 0) +
     (sensorData.smoke > S_THRESH ? 1 : 0) +
     (sensorData.flame ? 1 : 0);
-  sensorData.pts   = pts;
+  sensorData.pts = pts;
   sensorData.level = pts >= 2 ? 2 : pts === 1 ? 1 : 0;
 }
 
@@ -214,8 +227,11 @@ app.get("/api/status", (_req, res) =>
 );
 
 app.get("/api/ports", async (_req, res) => {
-  try { res.json(await SerialPort.list()); }
-  catch (err) { res.status(500).json({ error: err.message }); }
+  try {
+    res.json(await SerialPort.list());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post("/api/sim/data", (req, res) => {
@@ -223,8 +239,8 @@ app.post("/api/sim/data", (req, res) => {
     return res.status(400).json({ error: "Simulation mode is not active" });
   const { temperature, smoke, flame } = req.body;
   if (temperature !== undefined) sensorData.temperature = Number(temperature);
-  if (smoke       !== undefined) sensorData.smoke       = Number(smoke);
-  if (flame       !== undefined) sensorData.flame       = Boolean(flame);
+  if (smoke !== undefined) sensorData.smoke = Number(smoke);
+  if (flame !== undefined) sensorData.flame = Boolean(flame);
   recalcFusion();
   res.json({ ok: true, sensorData });
 });
@@ -233,8 +249,8 @@ app.post("/api/sim/toggle", (_req, res) => {
   sensorData.sim = !sensorData.sim;
   if (!sensorData.sim) {
     sensorData.temperature = 24;
-    sensorData.smoke       = 87;
-    sensorData.flame       = false;
+    sensorData.smoke = 87;
+    sensorData.flame = false;
     recalcFusion();
   }
   console.log(`🎮 Simulation: ${sensorData.sim ? "ON" : "OFF"}`);
@@ -243,8 +259,12 @@ app.post("/api/sim/toggle", (_req, res) => {
 
 app.post("/api/reset", (_req, res) => {
   Object.assign(sensorData, {
-    temperature: 24, smoke: 87, flame: false,
-    level: 0, pts: 0, uptime: "00:00:00",
+    temperature: 24,
+    smoke: 87,
+    flame: false,
+    level: 0,
+    pts: 0,
+    uptime: "00:00:00",
     lastNotification: null,
   });
   prevLevel = 0;
@@ -255,7 +275,9 @@ app.post("/api/reset", (_req, res) => {
 // Manual Blynk test notification (requires BLYNK_TOKEN env var)
 app.post("/api/notify/test", async (_req, res) => {
   if (!BLYNK_TOKEN)
-    return res.status(400).json({ error: "BLYNK_TOKEN not configured on server" });
+    return res
+      .status(400)
+      .json({ error: "BLYNK_TOKEN not configured on server" });
   await sendBlynkNotification(2, sensorData);
   res.json({ ok: true, notification: sensorData.lastNotification });
 });
@@ -267,6 +289,8 @@ app.listen(PORT, async () => {
   console.log("╚══════════════════════════════════════════════╝");
   console.log(`\n🚀 API     →  http://localhost:${PORT}/api/sensors`);
   console.log(`🔌 Ports   →  http://localhost:${PORT}/api/ports`);
-  console.log(`🔔 Blynk   →  ${BLYNK_TOKEN ? "ENABLED (server-side backup)" : "DISABLED — set BLYNK_TOKEN env var to enable"}\n`);
+  console.log(
+    `🔔 Blynk   →  ${BLYNK_TOKEN ? "ENABLED (server-side backup)" : "DISABLED — set BLYNK_TOKEN env var to enable"}\n`,
+  );
   await connectToESP32();
 });
